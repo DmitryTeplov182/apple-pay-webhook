@@ -316,10 +316,10 @@ function paymentFromRecord(record) {
     return null;
   }
   const fields = ["amount", "transaction", "name", "card", "merchant"];
-  if (!fields.some((key) => Object.prototype.hasOwnProperty.call(body, key))) {
+  const text = (key) => (body[key] == null ? "" : String(body[key]).trim());
+  if (!fields.every((key) => text(key) !== "")) {
     return null;
   }
-  const text = (key) => (body[key] == null ? "" : String(body[key]));
   const parsedAmount = parseSerbianAmount(text("amount"));
   return {
     amount: parsedAmount.amount,

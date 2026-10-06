@@ -97,7 +97,7 @@ merchant     → Merchant
 
 Неверный `WEBHOOK_ID` и неизвестный путь отвечают 404. Сравнение идентификатора побайтовое. `GET /health` отвечает `{"status":"ok"}` без входа.
 
-Webhook принимает любое тело. Платёж создаётся, если в JSON есть хотя бы одно из полей `amount`, `transaction`, `name`, `card`, `merchant`. Ожидаемая форма Shortcut, все поля строки:
+Webhook принимает любое тело. Платёж создаётся, только если в JSON есть все поля `amount`, `transaction`, `name`, `card` и `merchant`, и ни одно из них не пустое. Ожидаемая форма Shortcut, все поля строки:
 
 ```json
 {"amount":"1.234,56 RSD","transaction":"","name":"","card":"","merchant":""}
