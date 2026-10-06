@@ -1,9 +1,27 @@
-import { ensurePaymentCurrency, ensureSeller, handleAdmin, parseSerbianAmount } from "./portal.js";
-import { ensurePaymentExport, exportPendingPayments, syncZenmoneyTags } from "./zenmoney.js";
+import {
+  categorizePayment,
+  ensurePaymentCurrency,
+  ensureSeller,
+  expenseCategories,
+  handleAdmin,
+  parseSerbianAmount,
+} from "./portal.js";
+import {
+  altaTransactionId,
+  convertToRsd,
+  ensureNbsRates,
+  parseAltaSms,
+  zonedTimeToIso,
+} from "./alta.js";
+import {
+  ensureCategoryCommands,
+  ensurePaymentExport,
+  exportPendingPayments,
+  syncZenmoneyTags,
+} from "./zenmoney.js";
 
 const TELEGRAM_TEXT_LIMIT = 4000;
 const SYNC_BUTTON = "Sync categories";
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -19,6 +37,16 @@ export default {
     const telegramMatch = url.pathname.match(/^\/t\/([^/]+)$/);
     if (telegramMatch && request.method === "POST") {
       return handleTelegram(request, telegramMatch[1], env, ctx);
+    }
+
+    const notifyMatch = url.pathname.match(/^\/n\/([^/]+)$/);
+    if (notifyMatch && request.method === "POST") {
+      return handleNotifyTelegram(request, notifyMatch[1], env, ctx);
+    }
+
+    const altaMatch = url.pathname.match(/^\/a\/([^/]+)$/);
+    if (altaMatch && request.method === "POST") {
+      return handleAltaTelegram(request, altaMatch[1], env, ctx);
     }
 
     const zenmoneyMatch = url.pathname.match(/^\/z\/([^/]+)$/);
@@ -63,6 +91,7 @@ export default {
 
   async scheduled(_event, env, ctx) {
     ctx.waitUntil(syncAndNotify(env, false));
+    ctx.waitUntil(refreshNbsRates(env));
   },
 };
 
@@ -279,8 +308,15 @@ async function deliver(env, record, origin, paymentId) {
   if (paymentId) {
     await exportPendingPayments(env);
   }
-  await notifyTelegram(env, record);
-  await notifyPayment(env, record, origin, paymentId);
+  const posted = paymentId ? await zenmoneyPosted(env, paymentId) : false;
+  await Promise.all([
+    notifyTelegram(env, record),
+    notifyPayment(env, record, origin, paymentId),
+    debugStep(
+      env,
+      paymentId ? `платёж ${paymentId}\nzenmoney ${posted ? "✅" : "❌"}` : "платёж не создан",
+    ),
+  ]);
 }
 
 function formatPaymentTime(iso, timeZone) {
@@ -385,6 +421,276 @@ async function handleTelegram(request, candidate, env, ctx) {
   return json({ ok: true }, 200);
 }
 
+async function handleNotifyTelegram(request, candidate, env, ctx) {
+  if (!webhookIdConfigured(env.WEBHOOK_ID)) {
+    return json({ ok: false }, 500);
+  }
+  if (!idsMatch(candidate, env.WEBHOOK_ID.trim())) {
+    return json({ detail: "Not Found" }, 404);
+  }
+  const secret = request.headers.get("x-telegram-bot-api-secret-token") || "";
+  if (!idsMatch(secret, env.WEBHOOK_ID.trim())) {
+    return json({ detail: "Not Found" }, 404);
+  }
+
+  let update;
+  try {
+    update = await request.json();
+  } catch {
+    return json({ ok: true }, 200);
+  }
+
+  const expectedChat = notifyBot(env).chatId;
+  const message = update && update.message;
+  const chatId = message && message.chat ? String(message.chat.id) : "";
+  const text = message && typeof message.text === "string" ? message.text.trim() : "";
+  if (chatId === expectedChat && text) {
+    ctx.waitUntil(handleCategoryCommand(env, message, "notify"));
+  }
+  return json({ ok: true }, 200);
+}
+
+async function handleAltaTelegram(request, candidate, env, ctx) {
+  if (!webhookIdConfigured(env.WEBHOOK_ID)) {
+    return json({ ok: false }, 500);
+  }
+  if (!idsMatch(candidate, env.WEBHOOK_ID.trim())) {
+    return json({ detail: "Not Found" }, 404);
+  }
+  const secret = request.headers.get("x-telegram-bot-api-secret-token") || "";
+  if (!idsMatch(secret, env.WEBHOOK_ID.trim())) {
+    return json({ detail: "Not Found" }, 404);
+  }
+
+  let update;
+  try {
+    update = await request.json();
+  } catch {
+    return json({ ok: true }, 200);
+  }
+
+  const expectedChat = altaBot(env).chatId;
+  const message = update && update.message;
+  const chatId = message && message.chat ? String(message.chat.id) : "";
+  const text = message && typeof message.text === "string" ? message.text.trim() : "";
+  if (chatId !== expectedChat || !text) {
+    return json({ ok: true }, 200);
+  }
+  if (/^\/\d+_\d+(?:@\S+)?(?:\s+.*)?$/.test(text)) {
+    ctx.waitUntil(handleCategoryCommand(env, message, "alta"));
+    return json({ ok: true }, 200);
+  }
+  const origin = new URL(request.url).origin;
+  ctx.waitUntil(handleAltaSms(env, text, origin));
+  return json({ ok: true }, 200);
+}
+
+async function handleAltaSms(env, text, origin) {
+  const parsed = parseAltaSms(text);
+  if (!parsed) {
+    if (/placanje|odliv|banka/i.test(text)) {
+      await Promise.all([
+        sendTelegram(env, "не распознано", "alta"),
+        debugStep(env, "alta: не распознано"),
+      ]);
+    }
+    return;
+  }
+  try {
+    await ensureNbsRates(env);
+  } catch (error) {
+    console.error(
+      "NBS rates failed:",
+      error instanceof Error ? error.message : "NBS rates failed",
+    );
+  }
+  const money = await convertToRsd(env, parsed.currency, parsed.amount);
+  if (!money) {
+    await Promise.all([
+      sendTelegram(env, `нет курса ${parsed.currency}`, "alta"),
+      debugStep(env, `alta: нет курса ${parsed.currency}`),
+    ]);
+    return;
+  }
+  const transaction = await altaTransactionId(parsed.source);
+  const existing = await env.DB.prepare(
+    "SELECT id FROM payments WHERE \"transaction\" = ?",
+  )
+    .bind(transaction)
+    .first();
+  if (existing) {
+    await Promise.all([
+      sendTelegram(env, "уже есть", "alta"),
+      debugStep(env, `alta: уже есть ${existing.id}`),
+    ]);
+    return;
+  }
+  if (!parsed.card) {
+    parsed.card = await visaCard(env);
+  }
+  const createdAt = zonedTimeToIso(parsed.date, parsed.time, env.TIMEZONE);
+  const paymentId = await storeAltaPayment(env, parsed, money, transaction, createdAt);
+  if (!paymentId) {
+    await Promise.all([
+      sendTelegram(env, "не сохранилось", "alta"),
+      debugStep(env, "alta: не сохранилось"),
+    ]);
+    return;
+  }
+  await exportPendingPayments(env);
+  const posted = await zenmoneyPosted(env, paymentId);
+  const rateNote = money.rate
+    ? `${parsed.amount} ${parsed.currency} × ${money.rate} = ${money.amount} RSD (${money.rateDate})`
+    : `${money.amount} RSD`;
+  await Promise.all([
+    announcePayment(env, "alta", origin, paymentId, {
+      timeIso: createdAt,
+      card: parsed.card,
+      seller: parsed.merchant,
+      amount: money.amount,
+      currency: money.currency,
+    }),
+    debugStep(env, `alta платёж ${paymentId}\n${rateNote}\nzenmoney ${posted ? "✅" : "❌"}`),
+  ]);
+}
+
+async function storeAltaPayment(env, parsed, money, transaction, createdAt) {
+  const categoryId = await ensureSeller(env, parsed.merchant, parsed.merchant);
+  await ensurePaymentCurrency(env);
+  await ensurePaymentExport(env);
+  const inserted = await env.DB.prepare(
+    `INSERT INTO payments (
+      created_at, amount, currency, "transaction", name, card, merchant, category_id,
+      zenmoney_pending, raw
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+  )
+    .bind(
+      createdAt,
+      money.amount,
+      money.currency,
+      transaction,
+      parsed.merchant,
+      parsed.card,
+      parsed.merchant,
+      categoryId,
+      JSON.stringify({
+        source: "alta",
+        kind: parsed.kind,
+        account: parsed.account || null,
+        originalAmount: parsed.amount,
+        originalCurrency: parsed.currency,
+        rate: money.rate,
+        parity: money.parity,
+        rateDate: money.rateDate,
+      }),
+    )
+    .run();
+  return inserted.meta?.last_row_id || null;
+}
+
+async function visaCard(env) {
+  const row = await env.DB.prepare(
+    "SELECT card FROM payments WHERE card LIKE 'VISA **%' ORDER BY id DESC LIMIT 1",
+  ).first();
+  return (row && row.card) || "VISA";
+}
+
+async function refreshNbsRates(env) {
+  try {
+    await ensureNbsRates(env);
+  } catch (error) {
+    console.error(
+      "NBS rates failed:",
+      error instanceof Error ? error.message : "NBS rates failed",
+    );
+  }
+}
+
+async function handleCategoryCommand(env, message, botName) {
+  const text = typeof message.text === "string" ? message.text.trim() : "";
+  const command = text.match(/^\/(\d+)_(\d+)(?:@\S+)?(?:\s+.*)?$/);
+  if (!command) {
+    return;
+  }
+  const replyToUser = message.message_id;
+  const categories = await expenseCategories(env);
+  const category = categories.find((item) => Number(item.cmd) === Number(command[1]));
+  if (!category) {
+    await Promise.all([
+        sendTelegram(env, "нет такой категории", botName, { replyTo: replyToUser }),
+      debugStep(env, `команда ${text}\nнет такой категории`),
+    ]);
+    return;
+  }
+  const payment = await env.DB.prepare("SELECT id FROM payments WHERE id = ?")
+    .bind(Number(command[2]))
+    .first();
+  if (!payment) {
+    await Promise.all([
+      sendTelegram(env, "нет такого платежа", botName, { replyTo: replyToUser }),
+      debugStep(env, `команда ${text}\nнет такого платежа`),
+    ]);
+    return;
+  }
+  const saved = await categorizePayment(env, payment.id, category.id);
+  if (!saved) {
+    await Promise.all([
+      sendTelegram(env, "не сохранилось", botName, { replyTo: replyToUser }),
+      debugStep(env, `команда ${text}\nне сохранилось`),
+    ]);
+    return;
+  }
+  await exportPendingPayments(env);
+  await Promise.all([
+    debugStep(env, `команда ${text}`),
+    deleteNotifyMessage(env, botName, replyToUser).then((removed) =>
+      debugStep(env, removed ? "команда удалена" : "команда не удалена"),
+    ),
+    (async () => {
+      for (const paymentId of saved.paymentIds) {
+        const how = await settlePaymentNotice(env, paymentId, botName);
+        const line = await paymentStatusFromDb(env, paymentId);
+        await debugStep(env, [how, line].filter(Boolean).join("\n"), { html: true });
+      }
+    })(),
+  ]);
+}
+
+async function settlePaymentNotice(env, paymentId, fallbackBot = "notify") {
+  const text = await paymentStatusFromDb(env, paymentId);
+  if (!text) {
+    return `платёж ${paymentId}: не найден`;
+  }
+  const rows = await listNotifyMessages(env, paymentId);
+  const edited = rows.length
+    ? await editNotifyMessage(env, rows[0].bot, rows[0].message_id, text)
+    : false;
+  for (const row of rows.slice(edited ? 1 : 0)) {
+    await deleteNotifyMessage(env, row.bot, row.message_id);
+  }
+  if (edited) {
+    await env.DB.prepare(
+      "DELETE FROM notify_messages WHERE payment_id = ? AND NOT (bot = ? AND message_id = ?)",
+    )
+      .bind(paymentId, rows[0].bot, rows[0].message_id)
+      .run();
+    return `платёж ${paymentId}: сообщение обновлено`;
+  }
+  if (rows.length) {
+    await env.DB.prepare("DELETE FROM notify_messages WHERE payment_id = ?")
+      .bind(paymentId)
+      .run();
+  }
+  const botName = rows[0]?.bot || fallbackBot;
+  const sent = await sendTelegram(env, text, botName);
+  for (const messageId of sent || []) {
+    await rememberNotifyMessage(env, botName, messageId, paymentId);
+  }
+  return sent && sent.length
+    ? `платёж ${paymentId}: отправлено заново`
+    : `платёж ${paymentId}: сообщение не отправлено`;
+}
+
 async function syncAndNotify(env, notify) {
   try {
     const result = await syncZenmoneyTags(env);
@@ -419,6 +725,34 @@ function notifyBot(env) {
   };
 }
 
+function altaBot(env) {
+  return {
+    token: (env.ALTA_SMS_BOT_TOKEN || "").trim(),
+    chatId: (env.ALTA_SMS_BOT_ID || "").trim(),
+  };
+}
+
+function botByName(env, botName) {
+  if (botName === "debug") {
+    return debugBot(env);
+  }
+  if (botName === "alta") {
+    return altaBot(env);
+  }
+  return notifyBot(env);
+}
+
+async function debugStep(env, text, options) {
+  try {
+    await sendTelegram(env, text, "debug", options);
+  } catch (error) {
+    console.error(
+      "debug step failed:",
+      error instanceof Error ? error.message : "debug step failed",
+    );
+  }
+}
+
 async function notifyTelegram(env, record) {
   await sendTelegram(env, JSON.stringify(record, null, 2), "debug");
 }
@@ -429,36 +763,207 @@ async function notifyPayment(env, record, origin, paymentId) {
     return;
   }
   const seller = (payment.name || "").trim() || (payment.merchant || "").trim();
+  await announcePayment(env, "notify", origin, paymentId, {
+    timeIso: record.timestamp,
+    card: payment.card,
+    seller,
+    amount: payment.amount,
+    currency: payment.currency,
+  });
+}
+
+async function announcePayment(env, botName, origin, paymentId, view) {
   let category = "";
-  if (seller) {
+  if (view.seller) {
     const rule = await env.DB.prepare(
       `SELECT t.title AS category
        FROM merchant_rules r
        LEFT JOIN zenmoney_tags t ON t.id = r.category_id
        WHERE r.merchant_key = ?`,
     )
-      .bind(seller.toLowerCase())
+      .bind(view.seller.toLowerCase())
       .first();
     if (rule && rule.category) {
       category = rule.category;
     }
   }
-  const categoryText = category
-    ? escapeHtml(category)
-    : `<a href="${escapeHtml(origin)}/admin">без категории</a>`;
-  const amountText = [payment.amount, payment.currency].filter(Boolean).join(" ");
   const posted = await zenmoneyPosted(env, paymentId);
-  const parts = [`📅 ${escapeHtml(formatPaymentTime(record.timestamp, env.TIMEZONE))}`];
-  if (showCard(env) && payment.card) {
+  let text = paymentLine(env, {
+    time: formatPaymentTime(view.timeIso, env.TIMEZONE),
+    card: view.card,
+    seller: view.seller,
+    categoryHtml: category
+      ? escapeHtml(category)
+      : `<a href="${escapeHtml(origin)}/admin">без категории</a>`,
+    amount: view.amount,
+    currency: view.currency,
+    posted,
+  });
+  if (!category) {
+    await ensureCategoryCommands(env);
+    const categories = await expenseCategories(env);
+    const lines = paymentId
+      ? categories.map(
+        (item) => `/${item.cmd}_${paymentId} ${escapeHtml(String(item.title).replaceAll("\n", " "))}`,
+      )
+      : [];
+    if (lines.length) {
+      text = `${text}\n${lines.join("\n")}`;
+    }
+  }
+  const messageIds = await sendTelegram(env, text, botName);
+  if (paymentId) {
+    for (const messageId of messageIds || []) {
+      await rememberNotifyMessage(env, botName, messageId, paymentId);
+    }
+  }
+}
+
+async function paymentStatusFromDb(env, paymentId) {
+  const row = await env.DB.prepare(
+    `SELECT p.created_at, p.amount, p.currency, p.name, p.card, p.merchant,
+            p.zenmoney_id, p.zenmoney_pending, t.title AS category
+     FROM payments p
+     LEFT JOIN zenmoney_tags t ON t.id = p.category_id
+     WHERE p.id = ?`,
+  )
+    .bind(paymentId)
+    .first();
+  if (!row) {
+    return "";
+  }
+  const seller = (row.name || "").trim() || (row.merchant || "").trim();
+  return paymentLine(env, {
+    time: formatPaymentTime(row.created_at, env.TIMEZONE),
+    card: row.card,
+    seller,
+    categoryHtml: row.category ? escapeHtml(row.category) : "без категории",
+    amount: row.amount,
+    currency: row.currency,
+    posted: Boolean(row.zenmoney_id && row.zenmoney_pending === 0),
+  });
+}
+
+function paymentLine(env, payment) {
+  const parts = [`📅 ${escapeHtml(payment.time)}`];
+  if (payment.card && shouldShowCard(env, payment.card)) {
     parts.push(`💳 ${escapeHtml(payment.card)}`);
   }
-  parts.push(`🏪 ${escapeHtml(seller)}`);
-  parts.push(`🏷 ${categoryText}`);
+  parts.push(`🏪 ${escapeHtml(payment.seller)}`);
+  parts.push(`🏷 ${payment.categoryHtml}`);
+  const amountText = [payment.amount, payment.currency].filter(Boolean).join(" ");
   if (amountText) {
     parts.push(`💰 ${escapeHtml(amountText)}`);
   }
-  parts.push(`☯️ ${posted ? "✅" : "❌"}`);
-  await sendTelegram(env, parts.join(" "), "notify");
+  parts.push(`☯️ ${payment.posted ? "✅" : "❌"}`);
+  return parts.join(" ");
+}
+
+async function ensureNotifyMessages(env) {
+  const existing = await env.DB.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notify_messages'",
+  ).first();
+  if (!existing) {
+    await env.DB.prepare(
+      `CREATE TABLE notify_messages (
+        bot TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        payment_id INTEGER NOT NULL,
+        PRIMARY KEY (bot, message_id)
+      )`,
+    ).run();
+    return;
+  }
+  const info = await env.DB.prepare("PRAGMA table_info(notify_messages)").all();
+  const names = new Set((info.results || []).map((column) => column.name));
+  if (names.has("bot")) {
+    return;
+  }
+  await env.DB.prepare(
+    `CREATE TABLE notify_messages_v2 (
+      bot TEXT NOT NULL,
+      message_id INTEGER NOT NULL,
+      payment_id INTEGER NOT NULL,
+      PRIMARY KEY (bot, message_id)
+    )`,
+  ).run();
+  await env.DB.prepare(
+    `INSERT INTO notify_messages_v2 (bot, message_id, payment_id)
+     SELECT 'notify', message_id, payment_id FROM notify_messages`,
+  ).run();
+  await env.DB.prepare("DROP TABLE notify_messages").run();
+  await env.DB.prepare("ALTER TABLE notify_messages_v2 RENAME TO notify_messages").run();
+}
+
+async function rememberNotifyMessage(env, botName, messageId, paymentId) {
+  await ensureNotifyMessages(env);
+  await env.DB.prepare(
+    `INSERT INTO notify_messages (bot, message_id, payment_id) VALUES (?, ?, ?)
+     ON CONFLICT(bot, message_id) DO UPDATE SET payment_id = excluded.payment_id`,
+  )
+    .bind(botName, messageId, paymentId)
+    .run();
+}
+
+async function listNotifyMessages(env, paymentId) {
+  await ensureNotifyMessages(env);
+  const rows = await env.DB.prepare(
+    "SELECT bot, message_id FROM notify_messages WHERE payment_id = ? ORDER BY message_id",
+  )
+    .bind(paymentId)
+    .all();
+  return rows.results || [];
+}
+
+async function editNotifyMessage(env, botName, messageId, text) {
+  const bot = botByName(env, botName);
+  if (!bot.token) {
+    return false;
+  }
+  const result = await telegramMethod(bot.token, "editMessageText", {
+    chat_id: bot.chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
+  return Boolean(result && result.ok);
+}
+
+async function deleteNotifyMessage(env, botName, messageId) {
+  const bot = botByName(env, botName);
+  if (!bot.token || !messageId) {
+    return false;
+  }
+  const result = await telegramMethod(bot.token, "deleteMessage", {
+    chat_id: bot.chatId,
+    message_id: messageId,
+  });
+  return Boolean(result && result.ok);
+}
+
+async function telegramMethod(token, method, body) {
+  let response;
+  try {
+    response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    console.error(`telegram ${method} failed: request error`);
+    return null;
+  }
+  if (!response.ok) {
+    const detail = await response.text();
+    console.error(`telegram ${method} failed: HTTP ${response.status} ${detail}`);
+    return null;
+  }
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
 }
 
 async function zenmoneyPosted(env, paymentId) {
@@ -471,6 +976,14 @@ async function zenmoneyPosted(env, paymentId) {
     .bind(paymentId)
     .first();
   return Boolean(row && row.zenmoney_id && row.zenmoney_pending === 0);
+}
+
+function shouldShowCard(env, card) {
+  const name = String(card || "");
+  if (name === "VISA" || name.startsWith("VISA **")) {
+    return true;
+  }
+  return showCard(env);
 }
 
 function showCard(env) {
@@ -486,8 +999,8 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-async function sendTelegram(env, text, botName) {
-  const bot = botName === "notify" ? notifyBot(env) : debugBot(env);
+async function sendTelegram(env, text, botName, options = {}) {
+  const bot = botByName(env, botName);
   const token = bot.token;
   const chatId = bot.chatId;
   if (!token || !chatId) {
@@ -503,9 +1016,13 @@ async function sendTelegram(env, text, botName) {
     chunks.push(text);
   }
 
+  const messageIds = [];
   for (let index = 0; index < chunks.length; index += 1) {
     const payload = { chat_id: chatId, text: chunks[index] };
-    if (botName === "notify") {
+    if (options.replyTo && index === 0) {
+      payload.reply_to_message_id = options.replyTo;
+    }
+    if (botName === "notify" || botName === "alta" || options.html) {
       payload.parse_mode = "HTML";
       payload.disable_web_page_preview = true;
     }
@@ -528,15 +1045,24 @@ async function sendTelegram(env, text, botName) {
       );
     } catch {
       console.error("telegram notify failed: request error");
-      return;
+      return messageIds;
     }
     if (!response.ok) {
       const detail = await response.text();
       console.error(`telegram notify failed: HTTP ${response.status} ${detail}`);
-      return;
+      return messageIds;
+    }
+    try {
+      const body = await response.json();
+      if (body && body.result && body.result.message_id) {
+        messageIds.push(body.result.message_id);
+      }
+    } catch {
+      return messageIds;
     }
   }
   console.log("telegram notify sent");
+  return messageIds;
 }
 
 function bytesToBase64(bytes) {

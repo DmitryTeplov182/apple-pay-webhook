@@ -386,6 +386,44 @@ function merchantLabel(payment) {
   return (payment.name || "").trim() || (payment.merchant || "").trim();
 }
 
+export async function expenseCategories(env) {
+  const result = await env.DB.prepare(
+    `SELECT id, title, cmd
+     FROM zenmoney_tags
+     WHERE show_outcome = 1 AND cmd IS NOT NULL
+     ORDER BY cmd`,
+  ).all();
+  return result.results || [];
+}
+
+export async function categorizePayment(env, paymentId, categoryId) {
+  const category = await env.DB.prepare(
+    "SELECT id, title FROM zenmoney_tags WHERE id = ? AND show_outcome = 1",
+  )
+    .bind(categoryId)
+    .first();
+  if (!category) {
+    return null;
+  }
+  const payment = await env.DB.prepare(
+    "SELECT id, name, merchant FROM payments WHERE id = ?",
+  )
+    .bind(paymentId)
+    .first();
+  if (!payment) {
+    return null;
+  }
+  const label = merchantLabel(payment);
+  if (!label) {
+    return null;
+  }
+  await rememberRule(env, label, categoryId);
+  const ids = await paymentIdsForMerchant(env, label.toLowerCase());
+  const paymentIds = ids.length ? ids : [payment.id];
+  await applyCategory(env, paymentIds, categoryId);
+  return { seller: label, title: category.title, paymentIds };
+}
+
 export async function ensureSeller(env, name, merchant) {
   const label = merchantLabel({ name, merchant });
   if (!label) {

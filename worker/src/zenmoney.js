@@ -92,7 +92,42 @@ export async function syncZenmoneyTags(env) {
   const known = new Set((existing.results || []).map((row) => row.id));
   const added = tags.filter((tag) => !known.has(String(tag.id))).length;
   await saveTags(env, tags);
+  await ensureCategoryCommands(env);
   return { received: tags.length, added };
+}
+
+export async function ensureCategoryCommands(env) {
+  const info = await env.DB.prepare("PRAGMA table_info(zenmoney_tags)").all();
+  const names = new Set((info.results || []).map((column) => column.name));
+  if (!names.has("cmd")) {
+    await env.DB.prepare("ALTER TABLE zenmoney_tags ADD COLUMN cmd INTEGER").run();
+  }
+
+  const missing = await env.DB.prepare(
+    `SELECT id
+     FROM zenmoney_tags
+     WHERE show_outcome = 1 AND cmd IS NULL
+     ORDER BY title`,
+  ).all();
+  const rows = missing.results || [];
+  if (rows.length === 0) {
+    return;
+  }
+
+  const maxRow = await env.DB.prepare(
+    "SELECT COALESCE(MAX(cmd), 0) AS max_cmd FROM zenmoney_tags",
+  ).first();
+  let next = Number(maxRow && maxRow.max_cmd) || 0;
+  const statements = rows.map((row) => {
+    next += 1;
+    return env.DB.prepare(
+      "UPDATE zenmoney_tags SET cmd = ? WHERE id = ? AND cmd IS NULL",
+    ).bind(next, row.id);
+  });
+  const chunkSize = 40;
+  for (let index = 0; index < statements.length; index += chunkSize) {
+    await env.DB.batch(statements.slice(index, index + chunkSize));
+  }
 }
 
 function isExpense(tag) {
@@ -160,6 +195,7 @@ export async function ensurePaymentExport(env) {
 export async function exportPendingPayments(env) {
   try {
     await ensurePaymentExport(env);
+    await linkVisaCards(env);
     const ready = await env.DB.prepare(
       `SELECT
          p.id, p.created_at, p.amount, p.currency, p.name, p.merchant, p.card,
@@ -188,6 +224,30 @@ export async function exportPendingPayments(env) {
       "ZenMoney export failed:",
       error instanceof Error ? error.message : "export error",
     );
+  }
+}
+
+async function linkVisaCards(env) {
+  const mapped = await env.DB.prepare("SELECT card, account_id FROM card_accounts").all();
+  const rows = mapped.results || [];
+  if (rows.length !== 1) {
+    return;
+  }
+  const accountId = rows[0].account_id;
+  const cards = await env.DB.prepare(
+    `SELECT DISTINCT trim(card) AS card
+     FROM payments
+     WHERE trim(card) LIKE 'VISA **%' AND zenmoney_pending = 1`,
+  ).all();
+  for (const row of cards.results || []) {
+    if (!row.card || rows.some((item) => item.card === row.card)) {
+      continue;
+    }
+    await env.DB.prepare(
+      "INSERT INTO card_accounts (card, account_id) VALUES (?, ?) ON CONFLICT(card) DO NOTHING",
+    )
+      .bind(row.card, accountId)
+      .run();
   }
 }
 

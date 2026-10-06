@@ -66,6 +66,12 @@ printf '%s' "${DEBUG_BOT_TOKEN:-}" | wrangler secret put DEBUG_BOT_TOKEN
 printf '%s' "${DEBUG_CHAT_ID:-}" | wrangler secret put DEBUG_CHAT_ID
 printf '%s' "${NOTIFY_BOT_TOKEN:-}" | wrangler secret put NOTIFY_BOT_TOKEN
 printf '%s' "${NOTIFY_CHAT_ID:-}" | wrangler secret put NOTIFY_CHAT_ID
+if [[ -n "${ALTA_SMS_BOT_TOKEN:-}" ]]; then
+  printf '%s' "${ALTA_SMS_BOT_TOKEN}" | wrangler secret put ALTA_SMS_BOT_TOKEN
+fi
+if [[ -n "${ALTA_SMS_BOT_ID:-}" ]]; then
+  printf '%s' "${ALTA_SMS_BOT_ID}" | wrangler secret put ALTA_SMS_BOT_ID
+fi
 if [[ -n "${ZENMONEY_TOKEN:-}" ]]; then
   printf '%s' "${ZENMONEY_TOKEN}" | wrangler secret put ZENMONEY_TOKEN
 fi
@@ -87,5 +93,17 @@ if [[ -n "${DEBUG_BOT_TOKEN:-}" && -n "${DEBUG_CHAT_ID:-}" ]]; then
     -H "content-type: application/json" \
     --data "{\"chat_id\":\"${DEBUG_CHAT_ID}\",\"text\":\"Кнопка Sync categories обновляет категории Дзен-мани. То же самое происходит каждый час.\",\"reply_markup\":{\"keyboard\":[[{\"text\":\"Sync categories\"}]],\"resize_keyboard\":true,\"is_persistent\":true}}")"
   python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("debug keyboard", d.get("ok"))' "${keyboard_body}"
+fi
+if [[ -n "${NOTIFY_BOT_TOKEN:-}" ]]; then
+  notify_webhook="$(curl -sS -X POST "https://api.telegram.org/bot${NOTIFY_BOT_TOKEN}/setWebhook" \
+    -H "content-type: application/json" \
+    --data "{\"url\":\"https://${host}/n/${WEBHOOK_ID}\",\"secret_token\":\"${WEBHOOK_ID}\",\"allowed_updates\":[\"message\"]}")"
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("notify webhook", d.get("ok"), d.get("description", ""))' "${notify_webhook}"
+fi
+if [[ -n "${ALTA_SMS_BOT_TOKEN:-}" ]]; then
+  alta_webhook="$(curl -sS -X POST "https://api.telegram.org/bot${ALTA_SMS_BOT_TOKEN}/setWebhook" \
+    -H "content-type: application/json" \
+    --data "{\"url\":\"https://${host}/a/${WEBHOOK_ID}\",\"secret_token\":\"${WEBHOOK_ID}\",\"allowed_updates\":[\"message\"]}")"
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("alta webhook", d.get("ok"), d.get("description", ""))' "${alta_webhook}"
 fi
 echo "Готово: https://${host}/w/<WEBHOOK_ID из .env>"

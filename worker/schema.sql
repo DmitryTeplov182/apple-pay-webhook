@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS zenmoney_tags (
   show_income INTEGER NOT NULL,
   show_outcome INTEGER NOT NULL,
   changed INTEGER NOT NULL,
+  cmd INTEGER,
   raw TEXT NOT NULL
 );
 
@@ -61,4 +62,20 @@ CREATE TABLE IF NOT EXISTS zenmoney_accounts (
 CREATE TABLE IF NOT EXISTS card_accounts (
   card TEXT PRIMARY KEY,
   account_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notify_messages (
+  bot TEXT NOT NULL,
+  message_id INTEGER NOT NULL,
+  payment_id INTEGER NOT NULL,
+  PRIMARY KEY (bot, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS nbs_rates (
+  currency TEXT NOT NULL,
+  rate_date TEXT NOT NULL,
+  parity REAL NOT NULL,
+  middle REAL NOT NULL,
+  fetched_on TEXT NOT NULL,
+  PRIMARY KEY (currency, rate_date)
 );
