@@ -256,12 +256,18 @@ async function saveCard(env, ctx, request) {
   return json({ ok: true, ...(await listCards(env)) });
 }
 
+let merchantRulesReady = false;
+
 async function ensureRuleMerchant(env) {
+  if (merchantRulesReady) {
+    return;
+  }
   const info = await env.DB.prepare("PRAGMA table_info(merchant_rules)").all();
   const columns = info.results || [];
   const names = new Set(columns.map((column) => column.name));
   const category = columns.find((column) => column.name === "category_id");
   if (names.has("merchant") && category && !category.notnull) {
+    merchantRulesReady = true;
     return;
   }
 
@@ -289,6 +295,7 @@ async function ensureRuleMerchant(env) {
     env.DB.prepare("DROP TABLE merchant_rules"),
     env.DB.prepare("ALTER TABLE merchant_rules_next RENAME TO merchant_rules"),
   ]);
+  merchantRulesReady = true;
 }
 
 async function backfillSellers(env) {
@@ -312,10 +319,13 @@ async function rememberRule(env, label, categoryId) {
 }
 
 async function paymentIdsForMerchant(env, key) {
-  const rows = await env.DB.prepare("SELECT id, name, merchant FROM payments").all();
-  return (rows.results || [])
-    .filter((row) => merchantLabel(row).toLowerCase() === key)
-    .map((row) => row.id);
+  await ensurePaymentMerchantKey(env);
+  const rows = await env.DB.prepare(
+    "SELECT id FROM payments WHERE merchant_key = ?",
+  )
+    .bind(key)
+    .all();
+  return (rows.results || []).map((row) => row.id);
 }
 
 async function applyCategory(env, ids, categoryId) {
@@ -360,7 +370,12 @@ export function parseSerbianAmount(value) {
   return { amount, currency: match[3].toUpperCase() };
 }
 
+let paymentCurrencyReady = false;
+
 export async function ensurePaymentCurrency(env) {
+  if (paymentCurrencyReady) {
+    return;
+  }
   const info = await env.DB.prepare("PRAGMA table_info(payments)").all();
   const names = new Set((info.results || []).map((column) => column.name));
   if (!names.has("currency")) {
@@ -380,6 +395,46 @@ export async function ensurePaymentCurrency(env) {
       .bind(parsed.amount, parsed.currency, row.id)
       .run();
   }
+  paymentCurrencyReady = true;
+}
+
+let paymentMerchantKeyReady = false;
+
+export function merchantKey(name, merchant) {
+  const label = merchantLabel({ name, merchant });
+  return label ? label.toLowerCase() : "";
+}
+
+export async function ensurePaymentMerchantKey(env) {
+  if (paymentMerchantKeyReady) {
+    return;
+  }
+  const info = await env.DB.prepare("PRAGMA table_info(payments)").all();
+  const names = new Set((info.results || []).map((column) => column.name));
+  if (!names.has("merchant_key")) {
+    await env.DB.prepare("ALTER TABLE payments ADD COLUMN merchant_key TEXT NOT NULL DEFAULT ''").run();
+  }
+  await env.DB.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_payments_merchant_key ON payments (merchant_key)",
+  ).run();
+  const pending = await env.DB.prepare(
+    "SELECT id, name, merchant FROM payments WHERE merchant_key = ''",
+  ).all();
+  const statements = [];
+  for (const row of pending.results || []) {
+    const key = merchantKey(row.name, row.merchant);
+    if (!key) {
+      continue;
+    }
+    statements.push(
+      env.DB.prepare("UPDATE payments SET merchant_key = ? WHERE id = ?").bind(key, row.id),
+    );
+  }
+  const chunkSize = 40;
+  for (let index = 0; index < statements.length; index += chunkSize) {
+    await env.DB.batch(statements.slice(index, index + chunkSize));
+  }
+  paymentMerchantKeyReady = true;
 }
 
 function merchantLabel(payment) {

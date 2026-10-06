@@ -1,7 +1,9 @@
 import {
   categorizePayment,
   ensurePaymentCurrency,
+  ensurePaymentMerchantKey,
   ensureSeller,
+  merchantKey,
   expenseCategories,
   handleAdmin,
   parseSerbianAmount,
@@ -283,11 +285,12 @@ async function store(env, record) {
   const categoryId = await ensureSeller(env, payment.name, payment.merchant);
   await ensurePaymentCurrency(env);
   await ensurePaymentExport(env);
+  await ensurePaymentMerchantKey(env);
   const paymentInsert = env.DB.prepare(
     `INSERT INTO payments (
-      created_at, amount, currency, "transaction", name, card, merchant, category_id,
-      zenmoney_pending, raw
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+      created_at, amount, currency, "transaction", name, card, merchant, merchant_key,
+      category_id, zenmoney_pending, raw
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
   )
     .bind(
       record.timestamp,
@@ -297,6 +300,7 @@ async function store(env, record) {
       payment.name,
       payment.card,
       payment.merchant,
+      merchantKey(payment.name, payment.merchant),
       categoryId,
       JSON.stringify(payment),
     );
@@ -558,11 +562,12 @@ async function storeAltaPayment(env, parsed, money, transaction, createdAt) {
   const categoryId = await ensureSeller(env, parsed.merchant, parsed.merchant);
   await ensurePaymentCurrency(env);
   await ensurePaymentExport(env);
+  await ensurePaymentMerchantKey(env);
   const inserted = await env.DB.prepare(
     `INSERT INTO payments (
-      created_at, amount, currency, "transaction", name, card, merchant, category_id,
-      zenmoney_pending, raw
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+      created_at, amount, currency, "transaction", name, card, merchant, merchant_key,
+      category_id, zenmoney_pending, raw
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
   )
     .bind(
       createdAt,
@@ -572,6 +577,7 @@ async function storeAltaPayment(env, parsed, money, transaction, createdAt) {
       parsed.merchant,
       parsed.card,
       parsed.merchant,
+      merchantKey(parsed.merchant, parsed.merchant),
       categoryId,
       JSON.stringify({
         source: "alta",
@@ -613,8 +619,11 @@ async function handleCategoryCommand(env, message, botName) {
     return;
   }
   const replyToUser = message.message_id;
-  const categories = await expenseCategories(env);
-  const category = categories.find((item) => Number(item.cmd) === Number(command[1]));
+  const category = await env.DB.prepare(
+    "SELECT id, title FROM zenmoney_tags WHERE cmd = ? AND show_outcome = 1",
+  )
+    .bind(Number(command[1]))
+    .first();
   if (!category) {
     await Promise.all([
         sendTelegram(env, "нет такой категории", botName, { replyTo: replyToUser }),
@@ -859,7 +868,12 @@ function paymentLine(env, payment) {
   return parts.join(" ");
 }
 
+let notifyMessagesReady = false;
+
 async function ensureNotifyMessages(env) {
+  if (notifyMessagesReady) {
+    return;
+  }
   const existing = await env.DB.prepare(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notify_messages'",
   ).first();
@@ -872,11 +886,13 @@ async function ensureNotifyMessages(env) {
         PRIMARY KEY (bot, message_id)
       )`,
     ).run();
+    notifyMessagesReady = true;
     return;
   }
   const info = await env.DB.prepare("PRAGMA table_info(notify_messages)").all();
   const names = new Set((info.results || []).map((column) => column.name));
   if (names.has("bot")) {
+    notifyMessagesReady = true;
     return;
   }
   await env.DB.prepare(
@@ -893,6 +909,7 @@ async function ensureNotifyMessages(env) {
   ).run();
   await env.DB.prepare("DROP TABLE notify_messages").run();
   await env.DB.prepare("ALTER TABLE notify_messages_v2 RENAME TO notify_messages").run();
+  notifyMessagesReady = true;
 }
 
 async function rememberNotifyMessage(env, botName, messageId, paymentId) {

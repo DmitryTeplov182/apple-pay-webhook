@@ -88,19 +88,21 @@ export async function syncZenmoneyTags(env) {
     throw new Error("ZenMoney returned no expense tags");
   }
 
-  const existing = await env.DB.prepare("SELECT id FROM zenmoney_tags").all();
-  const known = new Set((existing.results || []).map((row) => row.id));
-  const added = tags.filter((tag) => !known.has(String(tag.id))).length;
-  await saveTags(env, tags);
+  const added = await saveTags(env, tags);
   await ensureCategoryCommands(env);
   return { received: tags.length, added };
 }
 
+let tagCommandColumnReady = false;
+
 export async function ensureCategoryCommands(env) {
-  const info = await env.DB.prepare("PRAGMA table_info(zenmoney_tags)").all();
-  const names = new Set((info.results || []).map((column) => column.name));
-  if (!names.has("cmd")) {
-    await env.DB.prepare("ALTER TABLE zenmoney_tags ADD COLUMN cmd INTEGER").run();
+  if (!tagCommandColumnReady) {
+    const info = await env.DB.prepare("PRAGMA table_info(zenmoney_tags)").all();
+    const names = new Set((info.results || []).map((column) => column.name));
+    if (!names.has("cmd")) {
+      await env.DB.prepare("ALTER TABLE zenmoney_tags ADD COLUMN cmd INTEGER").run();
+    }
+    tagCommandColumnReady = true;
   }
 
   const missing = await env.DB.prepare(
@@ -179,7 +181,12 @@ async function postDiff(token, body) {
   }
 }
 
+let paymentExportReady = false;
+
 export async function ensurePaymentExport(env) {
+  if (paymentExportReady) {
+    return;
+  }
   const info = await env.DB.prepare("PRAGMA table_info(payments)").all();
   const names = new Set((info.results || []).map((column) => column.name));
   if (!names.has("zenmoney_id")) {
@@ -190,6 +197,7 @@ export async function ensurePaymentExport(env) {
       "ALTER TABLE payments ADD COLUMN zenmoney_pending INTEGER NOT NULL DEFAULT 0",
     ).run();
   }
+  paymentExportReady = true;
 }
 
 export async function exportPendingPayments(env) {
@@ -353,8 +361,39 @@ function zenmoneyDate(iso, timeZone) {
   }
 }
 
+function tagRow(tag) {
+  return {
+    id: String(tag.id),
+    title: String(tag.title ?? ""),
+    parent_id: tag.parent ? String(tag.parent) : null,
+    show_income: tag.showIncome ? 1 : 0,
+    show_outcome: tag.showOutcome ? 1 : 0,
+    changed: Number(tag.changed) || 0,
+    raw: JSON.stringify(tag),
+  };
+}
+
+function tagChanged(previous, next) {
+  if (!previous) {
+    return true;
+  }
+  return previous.title !== next.title
+    || (previous.parent_id || null) !== next.parent_id
+    || Number(previous.show_income) !== next.show_income
+    || Number(previous.show_outcome) !== next.show_outcome
+    || Number(previous.changed) !== next.changed;
+}
+
 async function saveTags(env, tags) {
-  const statements = tags.map((tag) =>
+  const existing = await env.DB.prepare(
+    "SELECT id, title, parent_id, show_income, show_outcome, changed FROM zenmoney_tags",
+  ).all();
+  const known = new Map((existing.results || []).map((row) => [row.id, row]));
+  const incoming = tags.map(tagRow);
+  const incomingIds = new Set(incoming.map((tag) => tag.id));
+  const changed = incoming.filter((tag) => tagChanged(known.get(tag.id), tag));
+  const removed = [...known.keys()].filter((id) => !incomingIds.has(id));
+  const statements = changed.map((tag) =>
     env.DB.prepare(
       `INSERT INTO zenmoney_tags (
         id, title, parent_id, show_income, show_outcome, changed, raw
@@ -367,25 +406,25 @@ async function saveTags(env, tags) {
         changed = excluded.changed,
         raw = excluded.raw`,
     ).bind(
-      String(tag.id),
-      String(tag.title ?? ""),
-      tag.parent ? String(tag.parent) : null,
-      tag.showIncome ? 1 : 0,
-      tag.showOutcome ? 1 : 0,
-      Number(tag.changed) || 0,
-      JSON.stringify(tag),
+      tag.id,
+      tag.title,
+      tag.parent_id,
+      tag.show_income,
+      tag.show_outcome,
+      tag.changed,
+      tag.raw,
     ),
   );
-
-  const ids = tags.map((tag) => String(tag.id));
-  statements.push(
-    env.DB.prepare(
-      `DELETE FROM zenmoney_tags WHERE id NOT IN (${ids.map(() => "?").join(",")})`,
-    ).bind(...ids),
-  );
-
+  if (removed.length) {
+    statements.push(
+      env.DB.prepare(
+        `DELETE FROM zenmoney_tags WHERE id NOT IN (${[...incomingIds].map(() => "?").join(",")})`,
+      ).bind(...incomingIds),
+    );
+  }
   const chunkSize = 40;
   for (let index = 0; index < statements.length; index += chunkSize) {
     await env.DB.batch(statements.slice(index, index + chunkSize));
   }
+  return incoming.filter((tag) => !known.has(tag.id)).length;
 }

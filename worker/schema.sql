@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS payments (
   name TEXT NOT NULL,
   card TEXT NOT NULL,
   merchant TEXT NOT NULL,
+  merchant_key TEXT NOT NULL DEFAULT '',
   category_id TEXT,
   zenmoney_id TEXT,
   zenmoney_pending INTEGER NOT NULL DEFAULT 0,

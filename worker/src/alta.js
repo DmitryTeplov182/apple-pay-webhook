@@ -165,7 +165,12 @@ export async function convertToRsd(env, currency, amount) {
   };
 }
 
+let nbsTableReady = false;
+
 async function ensureNbsTable(env) {
+  if (nbsTableReady) {
+    return;
+  }
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS nbs_rates (
       currency TEXT NOT NULL,
@@ -176,6 +181,7 @@ async function ensureNbsTable(env) {
       PRIMARY KEY (currency, rate_date)
     )`,
   ).run();
+  nbsTableReady = true;
 }
 
 async function fetchNbsRates() {
